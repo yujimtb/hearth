@@ -1,0 +1,6 @@
+node_modules/
+.hearth/
+config.json
+*.log
+.claude/pm/implementation-result.md
+.claude/

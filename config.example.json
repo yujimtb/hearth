@@ -1,0 +1,13 @@
+{
+  "host": "127.0.0.1",
+  "port": 3000,
+  "data_dir": ".hearth",
+  "roots": ["D:\\userdata\\docs\\projects", "D:\\userdata\\docs\\work"],
+  "command_timeout_ms": 30000,
+  "max_output_bytes": 65536,
+  "artifact_preview_bytes": 4096,
+  "oracle": {
+    "command": "C:\\nvm4w\\nodejs\\oracle.cmd",
+    "armed": false
+  }
+}
