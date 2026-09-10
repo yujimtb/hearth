@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { Hearth, loadConfig } from '../src/hearth.js';
 import { createHandler, normalizeRouting, start } from '../src/server.js';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
-import { listCdpTargets, safeChatUrl, targetContains } from '../src/cdp.js';
+import { listCdpTargets, safeChatUrl, sendChatPrompt, targetContains } from '../src/cdp.js';
 
 const waitFor = async (fn, timeout = 5000) => {
   const deadline = Date.now() + timeout;
@@ -328,9 +328,10 @@ test('armed wake CDP failures cool down and exhaust bounded attempts', async t =
 });
 
 test('armed wake validates target URL and honors quiet cooldown and attempts', async t => {
-  const { hearth } = await fixture(t); hearth.config.oracle.armed = true; hearth.config.wake.armed = true; hearth.config.wake.quiet_ms = 100; hearth.config.wake.cooldown_ms = 1000; const route = { conversation_key: 'openai:wake-test', source: 'openai' }; hearth.ensureMailbox(route); const target = { id: 'wake-target', url: 'https://chatgpt.com/c/wake', webSocketDebuggerUrl: 'ws://127.0.0.1:9223/wake' }; hearth.cdp = { listTargets: async () => [target], contains: async () => false }; const calls = []; hearth.exec = async spec => (calls.push(spec), { state: 'completed' }); const at = new Date().toISOString();
+  const { hearth } = await fixture(t); hearth.config.wake.armed = true; hearth.config.wake.quiet_ms = 100; hearth.config.wake.cooldown_ms = 1000; const route = { conversation_key: 'openai:wake-test', source: 'openai' }; hearth.ensureMailbox(route); const target = { id: 'wake-target', url: 'https://chatgpt.com/c/wake', webSocketDebuggerUrl: 'ws://127.0.0.1:9223/wake' }; const calls = [];
+  hearth.cdp = { listTargets: async () => [target], contains: async () => false, send: async (seen, prompt) => { calls.push({ seen, prompt }); hearth.db.prepare('UPDATE mailboxes SET offered_seq=1 WHERE route_key=?').run(route.conversation_key); return { state: 'completed' }; } }; const at = new Date().toISOString();
   hearth.db.prepare('UPDATE mailboxes SET target_id=?,target_url=?,bound_at=?,last_activity_at=? WHERE route_key=?').run(target.id, target.url, at, new Date(Date.now() - 1000).toISOString(), route.conversation_key); hearth.db.prepare("INSERT INTO futures(id,route_key,kind,tool,dependencies,state,detached,at,updated_at,completed_at,result,mailbox_seq) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").run('wake-ready', route.conversation_key, 'generic', 'machine', '[]', 'completed', 1, at, at, at, '{"state":"completed"}', 1); hearth.db.prepare('UPDATE mailboxes SET wake_due_at=? WHERE route_key=?').run(new Date(Date.now() - 1).toISOString(), route.conversation_key);
-  await hearth.tickRoutes(); await waitFor(() => calls.length === 1); assert(calls[0].args.includes('wake-target')); assert(calls[0].args.at(-1).includes('consume ready arrivals')); await waitFor(() => !hearth.waking); await hearth.tickRoutes(); assert.equal(calls.length, 1);
+  await hearth.tickRoutes(); await waitFor(() => calls.length === 1); assert.equal(calls[0].seen.id, 'wake-target'); assert.match(calls[0].prompt, /machine with operation host_info exactly once/); assert.match(calls[0].prompt, /without polling/); assert.match(calls[0].prompt, /hearth-wake:/); await waitFor(() => !hearth.waking); await hearth.tickRoutes(); assert.equal(calls.length, 1);
   hearth.db.prepare('UPDATE mailboxes SET target_id=?,target_url=?,last_activity_at=?,last_wake_at=NULL,wake_attempts=0,wake_due_at=? WHERE route_key=?').run(target.id, target.url, new Date(Date.now() - 1000).toISOString(), new Date(Date.now() - 1).toISOString(), route.conversation_key); hearth.cdp.listTargets = async () => [{ ...target, url: 'https://chatgpt.com/c/other' }]; await hearth.tickRoutes(); assert.equal(calls.length, 1); assert.equal(hearth.db.prepare('SELECT target_id FROM mailboxes WHERE route_key=?').get(route.conversation_key).target_id, null);
 });
 
@@ -386,4 +387,64 @@ test('Windows UIA invokes only the disposable fixture button', { skip: process.p
   const invoked = await hearth.ui({ operation: 'action', hwnd: ready.hwnd, target: { automation_id: 'HearthInvokeButton' }, action: 'invoke' });
   assert.equal(invoked.state, 'completed'); assert.equal(invoked.method, 'uia.invoke');
   assert.equal(await waitFor(async () => { try { return (await readFile(actionFile, 'utf8')).trim(); } catch { return null; } }), 'invoked');
+});
+
+
+test('Windows cmd shims execute through ComSpec', { skip: process.platform !== 'win32' }, async t => {
+  const { hearth, root } = await fixture(t);
+  const script = path.join(root, 'echo-args.cmd');
+  await writeFile(script, '@echo off\r\necho %~1^|%~2\r\n');
+  const result = await hearth.exec({ command: script, args: ['alpha', 'two words'] });
+  assert.equal(result.state, 'completed');
+  assert.match(result.output, /\[stdout\] alpha\|two words/);
+});
+
+
+test('CDP wake writes the exact bounded prompt and submits it', async () => {
+  const OriginalWebSocket = globalThis.WebSocket; const requests = [];
+  class FakeWebSocket {
+    listeners = new Map();
+    addEventListener(name, fn) { if (!this.listeners.has(name)) this.listeners.set(name, []); this.listeners.get(name).push(fn); if (name === 'open') queueMicrotask(fn); }
+    send(body) {
+      const request = JSON.parse(body); requests.push(request);
+      const value = request.method === 'Runtime.evaluate' && request.params?.expression?.includes('inComposer') ? { inComposer: false, inConversation: false } : true;
+      const result = request.method === 'Runtime.evaluate' ? { result: { value } } : {};
+      queueMicrotask(() => (this.listeners.get('message') || []).forEach(fn => fn({ data: JSON.stringify({ id: request.id, result }) })));
+    }
+    close() {}
+  }
+  globalThis.WebSocket = FakeWebSocket;
+  try {
+    const prompt = 'Continue and consume arrivals. Wake token: hearth-wake:test';
+    const result = await sendChatPrompt({ url: 'https://chatgpt.com/c/wake-test', webSocketDebuggerUrl: 'ws://127.0.0.1:9223/devtools/page/wake' }, prompt, 'http://127.0.0.1:9223', 1000);
+    assert.equal(result.state, 'completed'); assert.equal(result.confirmation, 'composer-cleared');
+    assert.deepEqual(requests.map(request => request.method), ['Runtime.evaluate','Input.insertText','Runtime.evaluate','Input.dispatchKeyEvent','Input.dispatchKeyEvent','Runtime.evaluate']);
+    assert.equal(requests[1].params.text, prompt); assert.equal(requests[3].params.type, 'rawKeyDown');
+  } finally { globalThis.WebSocket = OriginalWebSocket; }
+});
+
+
+test('explicit detach returns a future immediately even for a fast primitive', async t => {
+  const { hearth } = await fixture(t);
+  const route1 = { conversation_key: 'local:explicit-detach', source: 'local', turn_key: 'turn-a' };
+  const first = structured(await hearth.dispatch('machine', { operation: 'host_info', detach: true }, route1));
+  assert.equal(first.state, 'pending'); assert(first.future_id);
+  await waitFor(() => hearth.db.prepare('SELECT state FROM futures WHERE id=?').get(first.future_id)?.state === 'completed');
+  const second = structured(await hearth.dispatch('machine', { operation: 'host_info' }, { ...route1, turn_key: 'turn-b' }));
+  assert.equal(second.arrivals.length, 1); assert.equal(second.arrivals[0].future_id, first.future_id);
+  assert.equal(second.arrivals[0].result.hostname, os.hostname());
+});
+
+test('run.scatter exposes heterogeneous future DAGs through the orchestration tool', async t => {
+  const { hearth, root } = await fixture(t); const file = path.join(root, 'scatter.txt'); await writeFile(file, 'scatter');
+  const route = { conversation_key: 'local:run-scatter', source: 'local', turn_key: 'turn-a' };
+  const first = structured(await hearth.dispatch('run', { operation: 'scatter', calls: [
+    { tool: 'machine', input: { operation: 'host_info' } },
+    { tool: 'fs', input: { operation: 'stat', path: file } }
+  ] }, route));
+  assert.equal(first.state, 'pending'); assert.equal(first.futures.length, 2);
+  await waitFor(() => first.futures.every(item => hearth.db.prepare('SELECT state FROM futures WHERE id=?').get(item.id)?.state === 'completed'));
+  const second = structured(await hearth.dispatch('machine', { operation: 'host_info' }, { ...route, turn_key: 'turn-b' }));
+  const delivered = [...(first.arrivals || []), ...second.arrivals].map(item => item.future_id);
+  assert.deepEqual(new Set(delivered), new Set(first.futures.map(item => item.id)));
 });

@@ -9,11 +9,11 @@ import { Hearth, loadConfig } from './hearth.js';
 const toolDescriptions = {
   machine: 'Host info, bounded foreground/parallel exec, and process list/kill.',
   fs: 'Contained list/read/search/stat and atomic write/patch/undo with SHA-256 concurrency.',
-  task: 'Immediate-return durable exec jobs and heterogeneous dependent future calls with status/wait/cancel/list.',
+  task: 'Immediate-return durable delayed exec jobs with status/wait/cancel/list.',
   artifact: 'Metadata, bounded range reads, and search for spilled large output.',
   ui: 'Serialized normalized Windows UI Automation snapshot/query/action.',
   recipe: 'Bounded declarative recipes, parameters, stats, traces, and repetition suggestions.',
-  run: 'Durable checkpoints and explicit delayed Oracle continuation records.'
+  run: 'Durable checkpoints and explicit delayed continuation records.'
 };
 
 const fingerprint = value => createHash('sha256').update(value).digest('hex');

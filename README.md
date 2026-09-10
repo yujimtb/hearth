@@ -25,7 +25,7 @@ Data defaults to `.hearth/hearth.db`, with artifacts and backups beside it. Keep
 
 Commands use direct executable/argv spawning (`shell: false`), bounded timeout and output, and a configurable concurrency cap. Large output spills to an artifact. Files must remain under configured roots after real-path/symlink checks. Writes and patches use same-directory temporary files plus rename, require an optional `expected_sha256`, and produce durable undo receipts. UI work is globally serialized and goes through a bounded STA PowerShell UIA bridge; fallback input is off unless `allow_fallback` is explicitly true and the request scopes it to an `hwnd` or `process_id`.
 
-Every operation returns a concise `state`: normally `completed`, `pending`, `blocked`, `conflict`, `partial`, `cancelled`, or `superseded`. Tool errors also set MCP `isError`. Each Hearth-produced MCP response also includes bounded `arrivals` from previously detached work for the same conversation. Dispatch starts immediately and races `dispatch_inline_budget_ms` (100 ms by default); a slower operation returns `{state:"pending",future_id}` and its durable completion piggybacks on a later Hearth call without polling. Arrival `seq` values reflect completion order, and large detached JSON spills to artifacts.
+Every operation returns a concise `state`: normally `completed`, `pending`, `blocked`, `conflict`, `partial`, `cancelled`, or `superseded`. Tool errors also set MCP `isError`. Each Hearth-produced MCP response also includes bounded `arrivals` from previously detached work for the same conversation. Dispatch starts immediately and races `dispatch_inline_budget_ms` (100 ms by default); a slower operation returns `{state:"pending",future_id}` and its durable completion piggybacks on a later Hearth call without polling. Every tool also accepts the common transport hint `detach:true`, which forces that immediate future response even for a fast primitive and is stripped before primitive execution. Arrival `seq` values reflect completion order, and large detached JSON spills to artifacts.
 
 ## Seven static tool contracts
 
@@ -61,7 +61,7 @@ Search skips symlinks and files over 2 MB. Reads and result counts are bounded.
 - `cancel`: `id`; queued generic futures cancel atomically, while already-running generic work reports that it cannot be cancelled safely
 - `list`: optional `limit`
 
-Independent due jobs and generic calls run concurrently under separate configured caps. Failed or missing generic dependencies block dependents explicitly. Routed task status/list/wait/cancel access is isolated to the same conversation. Queued exec jobs survive restart and an interrupted durable exec job is requeued; interrupted generic work becomes `blocked` instead of replaying a possibly side-effecting call.
+Independent due jobs and generic calls run concurrently under separate configured caps. Failed or missing generic dependencies block dependents explicitly. Routed task status/list/wait/cancel access is isolated to the same conversation. Current ChatGPT Web safety checks may reject a request that embeds arbitrary nested tool descriptors in `task.submit(calls[])`; on ChatGPT Web prefer ordinary primitive calls with `detach:true`, while `calls[]` remains useful to pi/opencode and other MCP clients. Queued exec jobs survive restart and an interrupted durable exec job is requeued; interrupted generic work becomes `blocked` instead of replaying a possibly side-effecting call.
 
 ### `artifact`
 
@@ -90,6 +90,7 @@ A step is `{primitive,input}`. Allowed primitives are `machine.exec`, `fs.read`,
 ### `run`
 
 - `checkpoint`: optional `id`, plus `objective`, `acceptance_criteria[]`, `summary`, `next_actions[]`, `pending_task_ids[]`
+- `scatter`: `calls:[{tool,input,dependencies?}]`; an orchestration alias for the heterogeneous future DAG, intended for clients that allow nested call specs
 - `list`, `get`, `close`
 - `schedule_continuation`: `run_id`, `prompt`, optional `delay_ms` or ISO `run_at`, optional `target: {session}` or `{browser_tab}`
 - `continuation_status`: `id`
@@ -116,7 +117,7 @@ tunnel-client run --profile hearth-local
 
 Then enable ChatGPT developer mode, open Plugins, create an app, select **Tunnel**, and choose/paste that tunnel ID. Keep both Hearth and `tunnel-client` running. Never place the runtime key in Hearth config. This tunnel is for private/developer use, not public plugin submission.
 
-Hearth hashes the tunnel's `openai/session` metadata with SHA-256 for mailbox routing and never passes raw OpenAI session, subject, organization, or request identifiers into persistence. Anonymous local stateless requests receive isolated request-scoped routes; local clients that need cross-request delivery can send `hearth/conversation` metadata. An early pending OpenAI response may include a reusable expiring `route_probe` nonce. The built-in loopback-only CDP binder can map that exact nonce to one unique ChatGPT tab with a stable `/c/<id>` conversation URL and persists only the route fingerprint, target ID, and stable conversation URL. Automatic wake is implemented but disabled by default: both `oracle.armed` and `wake.armed` must be enabled. When armed, Hearth wakes only a bound quiet conversation with undelivered terminal arrivals, using debounce, cooldown, and attempt limits; pending work alone never wakes a tab.
+Hearth hashes the tunnel's `openai/session` metadata with SHA-256 for mailbox routing and never passes raw OpenAI session, subject, organization, or request identifiers into persistence. Anonymous local stateless requests receive isolated request-scoped routes; local clients that need cross-request delivery can send `hearth/conversation` metadata. An early pending OpenAI response may include a reusable expiring `route_probe` nonce. The built-in loopback-only CDP binder can map that exact nonce to one unique ChatGPT tab with a stable `/c/<id>` conversation URL and persists only the route fingerprint, target ID, and stable conversation URL. Automatic wake is implemented but disabled by default; set `wake.armed:true` to enable it. It uses the already-bound loopback CDP target directly and does not require `oracle.armed`. When armed, Hearth wakes only a bound quiet conversation with undelivered terminal arrivals, using debounce, cooldown, and attempt limits; pending work alone never wakes a tab. The wake prompt asks ChatGPT to make one known-safe `machine.host_info` call, whose normal response piggybacks the ready arrivals, then continue the prior task from them. Oracle remains separate for explicitly scheduled continuation records.
 
 ## Validation
 
@@ -124,4 +125,4 @@ Hearth hashes the tunnel's `openai/session` metadata with SHA-256 for mailbox ro
 npm test
 ```
 
-The tests pin MCP `2026-07-28` and exercise discovery/list/call, two clients, fs conflict/undo/containment, spill/range/search, immediate delayed/dependent/concurrent jobs, async mailbox detachment/isolation/completion order/retry cursors/bounds, heterogeneous future DAGs and restart safety, routing metadata normalization, fake CDP binding with wake disarmed, recipe stats/traces/suggestions, due dry-run continuations, a bounded desktop snapshot, and a semantic invoke against a disposable WPF window. The live tunnel and armed browser wake require the operator's running environment and are not exercised by local tests.
+The tests pin MCP `2026-07-28` and exercise discovery/list/call, two clients, fs conflict/undo/containment, spill/range/search, immediate delayed/dependent/concurrent jobs, automatic and explicit detachment, async mailbox isolation/completion order/retry cursors/bounds, heterogeneous future DAGs and restart safety, routing metadata normalization, CDP route binding and bounded wake submission, recipe stats/traces/suggestions, due dry-run continuations, a bounded desktop snapshot, and a semantic invoke against a disposable WPF window. The live Secure MCP Tunnel path and ChatGPT model behavior are additionally verified manually because they require the signed-in browser environment.

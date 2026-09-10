@@ -6,7 +6,7 @@ import path from 'node:path';
 import os from 'node:os';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
-import { listCdpTargets, safeChatUrl, targetContains } from './cdp.js';
+import { listCdpTargets, safeChatUrl, sendChatPrompt, targetContains } from './cdp.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const tools = new Set(['machine','fs','task','artifact','ui','recipe','run']);
@@ -81,7 +81,7 @@ export class Hearth {
     this.active = new Map();
     this.futureActive = new Map();
     this.detachedActive = new Set();
-    this.cdp = config.cdp || { listTargets: listCdpTargets, contains: (target, nonce) => targetContains(target, nonce, config.wake.cdp_url) };
+    this.cdp = config.cdp || { listTargets: listCdpTargets, contains: (target, nonce) => targetContains(target, nonce, config.wake.cdp_url), send: (target, prompt) => sendChatPrompt(target, prompt, config.wake.cdp_url, Math.min(config.wake.timeout_ms, 30_000)) };
     this.closing = false;
     this.uiTail = Promise.resolve();
     this.fsTail = Promise.resolve();
@@ -195,8 +195,11 @@ export class Hearth {
     const timeoutMs = Math.min(Math.max(spec.timeout_ms || this.config.command_timeout_ms, 1), 300_000);
     const started = Date.now();
     const env = { ...process.env, ...(spec.env || {}) };
+    const cmdShim = process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(spec.command);
+    const command = cmdShim ? (process.env.ComSpec || 'cmd.exe') : spec.command;
+    const args = cmdShim ? ['/d','/s','/c','call',spec.command,...(spec.args || [])] : (spec.args || []);
     return await new Promise(resolve => {
-      const child = spawn(spec.command, spec.args || [], { cwd, env, shell: false, windowsHide: true, detached: process.platform !== 'win32' });
+      const child = spawn(command, args, { cwd, env, shell: false, windowsHide: true, detached: process.platform !== 'win32' });
       controls.child = child;
       const chunks = []; let bytes = 0; let overflow = false; let timedOut = false;
       const collect = (source, chunk) => {
@@ -452,7 +455,7 @@ export class Hearth {
     assertNoSecrets(calls); const routeKey = this.ensureMailbox(routing); const ids = calls.map(() => randomUUID()); const batchId = randomUUID(); const created = now();
     const dependencies = calls.map((call, index) => {
       if (!tools.has(call.tool)) throw new Error(`unknown tool: ${call.tool}`);
-      if (call.tool === 'task' && call.input?.operation === 'submit' && call.input?.calls !== undefined) throw new Error('recursive task scatter is not allowed');
+      if ((call.tool === 'task' && call.input?.operation === 'submit' && call.input?.calls !== undefined) || (call.tool === 'run' && call.input?.operation === 'scatter')) throw new Error('recursive scatter is not allowed');
       const refs = this.referenceIds(call.input || {}); const values = [...(call.dependencies || []), ...refs];
       return [...new Set(values.map(value => { if (Number.isInteger(value)) { if (value < 0 || value >= ids.length || value === index) throw new Error(`invalid batch dependency index: ${value}`); return ids[value]; } if (typeof value !== 'string' || !value) throw new Error('dependency must be a future ID or valid batch index'); return value; }))];
     });
@@ -611,7 +614,7 @@ export class Hearth {
         this.detachedActive.add(work);
       }
     }
-    if (this.config.wake.armed !== true || this.config.oracle.armed !== true || this.waking) return;
+    if (this.config.wake.armed !== true || this.waking) return;
     const timestamp = now(); const quietCutoff = new Date(Date.now() - this.config.wake.quiet_ms).toISOString(); const cooldownCutoff = new Date(Date.now() - this.config.wake.cooldown_ms).toISOString();
     const routes = this.db.prepare("SELECT * FROM mailboxes WHERE target_id IS NOT NULL AND wake_claimed_at IS NULL AND wake_due_at IS NOT NULL AND wake_due_at<=? AND last_activity_at<=? AND (last_wake_at IS NULL OR last_wake_at<=?) AND wake_attempts<? AND EXISTS(SELECT 1 FROM futures WHERE route_key=mailboxes.route_key AND mailbox_seq>mailboxes.ack_seq) ORDER BY wake_due_at LIMIT 8").all(timestamp, quietCutoff, cooldownCutoff, this.config.wake.max_attempts);
     if (!routes.length) return;
@@ -620,15 +623,26 @@ export class Hearth {
       for (const route of routes) this.db.prepare('UPDATE mailboxes SET wake_attempts=wake_attempts+1,last_wake_at=?,wake_due_at=CASE WHEN wake_attempts+1>=? THEN NULL ELSE ? END WHERE route_key=?').run(failedAt, this.config.wake.max_attempts, retryAt, route.route_key);
       this.event('route.wake_validation_failed', null, { error: error.message }); return;
     }
-    const route = routes.find(candidate => targets.some(target => target.id === candidate.target_id && safeChatUrl(target.url) === candidate.target_url));
-    for (const candidate of routes.filter(candidate => !targets.some(target => target.id === candidate.target_id && safeChatUrl(target.url) === candidate.target_url))) this.db.prepare('UPDATE mailboxes SET target_id=NULL,target_url=NULL,bound_at=NULL,wake_due_at=NULL WHERE route_key=?').run(candidate.route_key);
+    const targetFor = candidate => targets.find(target => target.id === candidate.target_id && safeChatUrl(target.url) === candidate.target_url);
+    const route = routes.find(candidate => targetFor(candidate));
+    for (const candidate of routes.filter(candidate => !targetFor(candidate))) this.db.prepare('UPDATE mailboxes SET target_id=NULL,target_url=NULL,bound_at=NULL,wake_due_at=NULL WHERE route_key=?').run(candidate.route_key);
     if (!route) return;
-    const claimed = now(); const cursor = this.db.prepare('SELECT MAX(mailbox_seq) AS seq FROM futures WHERE route_key=?').get(route.route_key).seq; const update = this.db.prepare('UPDATE mailboxes SET wake_claimed_at=?,wake_due_at=NULL,wake_attempts=wake_attempts+1,last_wake_at=?,wake_cursor=? WHERE route_key=? AND wake_claimed_at IS NULL').run(claimed, claimed, cursor, route.route_key); if (!update.changes) return;
+    const target = targetFor(route); const claimed = now(); const cursor = this.db.prepare('SELECT MAX(mailbox_seq) AS seq FROM futures WHERE route_key=?').get(route.route_key).seq; const update = this.db.prepare('UPDATE mailboxes SET wake_claimed_at=?,wake_due_at=NULL,wake_attempts=wake_attempts+1,last_wake_at=?,wake_cursor=? WHERE route_key=? AND wake_claimed_at IS NULL').run(claimed, claimed, cursor, route.route_key); if (!update.changes) return;
     this.waking = true;
-    const wake = this.exec({ command: this.config.oracle.command, args: ['--engine','browser','--browser-attach-running','--remote-chrome',new URL(this.config.wake.cdp_url).host,'--browser-tab',route.target_id,'--browser-model-strategy','current','--no-notify','Continue this conversation and call Hearth once to consume ready arrivals.'], timeout_ms: this.config.wake.timeout_ms }, { inlineLimit: 4096 }).then(result => this.event('route.wake', null, { state: result.state })).catch(error => this.event('route.wake', null, { state: 'blocked', error: error.message })).finally(() => {
+    const wakePrompt = `Use only Hearth. First call machine with operation host_info exactly once. Read any arrivals in that Hearth result, then continue the prior task from those results without polling. Wake token: hearth-wake:${randomUUID()}`;
+    const wake = Promise.resolve().then(() => this.cdp.send(target, wakePrompt)).then(async result => {
+      if (result?.state && result.state !== 'completed') throw new Error(`CDP wake returned ${result.state}`);
+      const deadline = Date.now() + this.config.wake.timeout_ms;
+      while (this.db && Date.now() < deadline) {
+        const current = this.db.prepare('SELECT offered_seq FROM mailboxes WHERE route_key=?').get(route.route_key);
+        if (current?.offered_seq >= cursor) { this.event('route.wake', null, { state: 'completed' }); return; }
+        await sleep(250);
+      }
+      this.event('route.wake', null, { state: 'partial', error: 'wake prompt sent but arrivals were not offered before timeout' });
+    }).catch(error => this.event('route.wake', null, { state: 'blocked', error: error.message })).finally(() => {
       if (this.db) {
-        const current = this.db.prepare('SELECT ack_seq,wake_attempts,wake_due_at FROM mailboxes WHERE route_key=?').get(route.route_key); const max = this.db.prepare('SELECT MAX(mailbox_seq) AS seq FROM futures WHERE route_key=?').get(route.route_key).seq;
-        const retry = current.ack_seq < max && current.wake_attempts < this.config.wake.max_attempts ? current.wake_due_at || new Date(Date.now() + this.config.wake.cooldown_ms).toISOString() : null;
+        const current = this.db.prepare('SELECT offered_seq,wake_attempts,wake_due_at FROM mailboxes WHERE route_key=?').get(route.route_key); const max = this.db.prepare('SELECT MAX(mailbox_seq) AS seq FROM futures WHERE route_key=?').get(route.route_key).seq;
+        const retry = current.offered_seq < max && current.wake_attempts < this.config.wake.max_attempts ? current.wake_due_at || new Date(Date.now() + this.config.wake.cooldown_ms).toISOString() : null;
         this.db.prepare('UPDATE mailboxes SET wake_claimed_at=NULL,wake_due_at=? WHERE route_key=?').run(retry, route.route_key);
       }
       this.waking = false; this.detachedActive.delete(wake);
@@ -691,7 +705,8 @@ export class Hearth {
     return { state: 'pending', due: true, dry_run: false, command: this.config.oracle.command, args, reason: 'armed adapter command is exposed for explicit execution; no secrets are stored' };
   }
 
-  async run(input) {
+  async run(input, routing) {
+    if (input.operation === 'scatter') return this.submitCalls(input.calls, routing);
     if (input.operation === 'checkpoint') {
       const id = input.id || randomUUID(); const existing = this.db.prepare('SELECT state,at FROM runs WHERE id=?').get(id); const body = { objective: input.objective, acceptance_criteria: input.acceptance_criteria || [], summary: input.summary || '', next_actions: input.next_actions || [], pending_task_ids: input.pending_task_ids || [] }; assertNoSecrets(body); const at = now();
       if (existing) this.db.prepare("UPDATE runs SET updated_at=?,state='open',body=? WHERE id=?").run(at, json(body), id); else this.db.prepare("INSERT INTO runs(id,at,updated_at,state,body) VALUES(?,?,?,?,?)").run(id, at, at, 'open', json(body));
@@ -737,7 +752,7 @@ export class Hearth {
     if (tool === 'artifact') return this.artifact(input);
     if (tool === 'ui') return this.ui(input);
     if (tool === 'recipe') return this.recipe(input);
-    if (tool === 'run') return this.run(input);
+    if (tool === 'run') return this.run(input, routing);
     throw new Error('unknown tool');
   }
 
@@ -756,8 +771,16 @@ export class Hearth {
     if (this.closing) throw new Error('Hearth is closing');
     const routeKey = this.beginRequest(routing); const id = randomUUID(); const created = now();
     this.db.prepare("INSERT INTO futures(id,route_key,kind,tool,dependencies,state,detached,at,updated_at,started_at) VALUES(?,?,?,?,?,?,?,?,?,?)").run(id, routeKey, 'dispatch', tool, '[]', 'running', 0, created, created, created);
-    let finished = false; let detached = false; let value; let failed = false;
-    const operation = Promise.resolve().then(() => this.executePrimitive(tool, input, routing)).then(async output => { finished = true; value = output; if (detached) await this.completeFuture(id, output); return output; }).catch(async error => { finished = true; failed = true; value = { state: 'blocked', error: error.message }; this.event('tool.error', tool, value); if (detached) await this.completeFuture(id, value, 'blocked'); return value; });
+    const forceDetached = input?.detach === true; const primitiveInput = input && typeof input === 'object' ? { ...input } : input; if (primitiveInput && typeof primitiveInput === 'object') delete primitiveInput.detach;
+    let finished = false; let detached = forceDetached; let value; let failed = false;
+    const operation = Promise.resolve().then(() => this.executePrimitive(tool, primitiveInput, routing)).then(async output => { finished = true; value = output; if (detached) await this.completeFuture(id, output); return output; }).catch(async error => { finished = true; failed = true; value = { state: 'blocked', error: error.message }; this.event('tool.error', tool, value); if (detached) await this.completeFuture(id, value, 'blocked'); return value; });
+    if (forceDetached) {
+      this.db.prepare('UPDATE futures SET detached=1 WHERE id=?').run(id);
+      const arrivals = this.offerArrivals(routeKey); const probe = this.routeProbe(routeKey);
+      const output = { state: 'pending', future_id: id, ...(probe && { route_probe: probe }), arrivals };
+      const tracked = operation.finally(() => this.detachedActive.delete(tracked)); this.detachedActive.add(tracked);
+      return this.result(output);
+    }
     const won = await Promise.race([operation.then(() => true), sleep(this.config.dispatch_inline_budget_ms).then(() => false)]);
     if (won && finished) { this.db.prepare('DELETE FROM futures WHERE id=?').run(id); const probe = value?.state === 'pending' && this.routeProbe(routeKey); return this.dispatchResult(value, routeKey, failed, probe ? { route_probe: probe } : {}); }
     const arrivals = this.offerArrivals(routeKey); detached = true; this.db.prepare('UPDATE futures SET detached=1 WHERE id=?').run(id);

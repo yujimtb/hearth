@@ -59,3 +59,51 @@ export async function targetContains(target, nonce, endpoint, timeoutMs = 2000) 
     socket.addEventListener('close', () => finish(null, false));
   });
 }
+
+
+export async function sendChatPrompt(target, prompt, endpoint, timeoutMs = 30000) {
+  if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 2000) throw new Error('bounded wake prompt required');
+  if (!safeChatUrl(target?.url)) throw new Error('unsafe ChatGPT target URL');
+  const socketUrl = safeWebSocketUrl(target?.webSocketDebuggerUrl, endpoint);
+  if (!socketUrl) throw new Error('unsafe CDP websocket URL');
+  const socket = new WebSocket(socketUrl); let seq = 0; const pending = new Map(); let closed = false;
+  const close = error => {
+    if (closed) return; closed = true;
+    for (const waiter of pending.values()) waiter.reject(error || new Error('CDP websocket closed')); pending.clear();
+    try { socket.close(); } catch {}
+  };
+  const opened = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('CDP websocket open timed out')), timeoutMs);
+    socket.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
+    socket.addEventListener('error', () => { clearTimeout(timer); reject(new Error('CDP websocket failed')); }, { once: true });
+  });
+  socket.addEventListener('message', event => {
+    let message; try { message = JSON.parse(String(event.data)); } catch { return; }
+    const waiter = pending.get(message.id); if (!waiter) return; pending.delete(message.id);
+    if (message.error) waiter.reject(new Error(message.error.message || 'CDP command failed')); else waiter.resolve(message.result);
+  });
+  socket.addEventListener('close', () => close(new Error('CDP websocket closed')));
+  const rpc = (method, params = {}) => timeout(new Promise((resolve, reject) => {
+    const id = ++seq; pending.set(id, { resolve, reject }); socket.send(JSON.stringify({ id, method, params }));
+  }), timeoutMs, `CDP ${method} timed out`);
+  try {
+    await opened;
+    const focus = await rpc('Runtime.evaluate', { expression: `(() => { const e=document.querySelector('#prompt-textarea[contenteditable="true"]'); if(!e) return false; e.focus(); const s=getSelection(),r=document.createRange(); r.selectNodeContents(e); s.removeAllRanges(); s.addRange(r); return true; })()`, returnByValue: true });
+    if (focus?.result?.value !== true) throw new Error('ChatGPT composer not available');
+    await rpc('Input.insertText', { text: prompt });
+    const needle = JSON.stringify(prompt);
+    const inserted = await rpc('Runtime.evaluate', { expression: `Boolean((document.querySelector('#prompt-textarea[contenteditable="true"]')?.innerText||'').includes(${needle}))`, returnByValue: true });
+    if (inserted?.result?.value !== true) throw new Error('wake prompt was not inserted');
+    await rpc('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+    await rpc('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+    await new Promise(resolve => setTimeout(resolve, 250));
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const status = await rpc('Runtime.evaluate', { expression: `(() => { const composer=(document.querySelector('#prompt-textarea[contenteditable="true"]')?.innerText||''); return { inComposer: composer.includes(${needle}), inConversation: document.documentElement?.innerText?.includes(${needle}) === true }; })()`, returnByValue: true });
+      const value = status?.result?.value;
+      if (value && value.inComposer === false) return { state: 'completed', confirmation: value.inConversation ? 'conversation' : 'composer-cleared' };
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    throw new Error('wake prompt remained in composer');
+  } finally { close(); }
+}
