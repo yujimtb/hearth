@@ -6,8 +6,25 @@
   "command_timeout_ms": 30000,
   "max_output_bytes": 65536,
   "artifact_preview_bytes": 4096,
+  "dispatch_inline_budget_ms": 100,
+  "mailbox_max_arrivals": 16,
+  "mailbox_max_bytes": 32768,
+  "future_result_inline_bytes": 16384,
+  "max_concurrent_futures": 4,
+  "future_input_max_bytes": 262144,
   "oracle": {
     "command": "C:\\nvm4w\\nodejs\\oracle.cmd",
     "armed": false
+  },
+  "wake": {
+    "armed": false,
+    "cdp_url": "http://127.0.0.1:9223",
+    "quiet_ms": 15000,
+    "debounce_ms": 500,
+    "cooldown_ms": 60000,
+    "max_attempts": 2,
+    "probe_ttl_ms": 600000,
+    "probe_interval_ms": 2000,
+    "timeout_ms": 120000
   }
 }
