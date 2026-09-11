@@ -78,9 +78,13 @@ function Find-Target($root, $target) {
   if ($target.automation_id) { $conditions.Add([Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::AutomationIdProperty, [string]$target.automation_id)) }
   if ($target.name) { $conditions.Add([Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::NameProperty, [string]$target.name)) }
   if ($target.control_type) {
-    $property = [Windows.Automation.ControlType].GetProperty(([string]$target.control_type), [Reflection.BindingFlags]'Public,Static,IgnoreCase')
-    if (-not $property) { throw 'unknown control_type' }
-    $conditions.Add([Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, $property.GetValue($null, $null)))
+    $flags = [Reflection.BindingFlags]'Public,Static,IgnoreCase'
+    $name = [string]$target.control_type
+    $property = [Windows.Automation.ControlType].GetProperty($name, $flags)
+    $field = if ($property) { $null } else { [Windows.Automation.ControlType].GetField($name, $flags) }
+    $resolved = if ($property) { $property.GetValue($null, $null) } elseif ($field) { $field.GetValue($null) } else { $null }
+    if (-not $resolved) { throw 'unknown control_type' }
+    $conditions.Add([Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty, $resolved))
   }
   if ($conditions.Count -eq 0) { throw 'target requires automation_id, name, or control_type' }
   $condition = if ($conditions.Count -eq 1) { $conditions[0] } else { [Windows.Automation.AndCondition]::new($conditions.ToArray()) }
@@ -107,7 +111,7 @@ try {
   }
   if ($request.operation -eq 'action') {
     $element = Find-Target $root $request.target
-    if (-not $element.Current.IsEnabled -or $element.Current.IsOffscreen) { throw 'target is disabled or offscreen' }
+    if (-not $element.Current.IsEnabled) { throw 'target is disabled' }
     $method = $null
     if ($request.action -eq 'invoke') {
       try { $pattern = $element.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern); $pattern.Invoke(); $method='uia.invoke' } catch {}
@@ -116,6 +120,7 @@ try {
       $pattern = $element.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern); $pattern.SetValue([string]$request.value); $method='uia.value'
     }
     if (-not $method -and $request.allow_fallback) {
+      if ($element.Current.IsOffscreen) { throw 'target is offscreen; physical fallback is unavailable' }
       $window = $root.Current.NativeWindowHandle
       if ($window -and -not [HearthInput]::SetForegroundWindow([IntPtr]$window)) { throw 'could not foreground target window' }
       $rect = $element.Current.BoundingRectangle

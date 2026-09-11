@@ -25,7 +25,9 @@ Data defaults to `.hearth/hearth.db`, with artifacts and backups beside it. Keep
 
 Commands use direct executable/argv spawning (`shell: false`), bounded timeout and output, and a configurable concurrency cap. Large output spills to an artifact. Files must remain under configured roots after real-path/symlink checks. Writes and patches use same-directory temporary files plus rename, require an optional `expected_sha256`, and produce durable undo receipts. UI work is globally serialized and goes through a bounded STA PowerShell UIA bridge; fallback input is off unless `allow_fallback` is explicitly true and the request scopes it to an `hwnd` or `process_id`.
 
-Every operation returns a concise `state`: normally `completed`, `pending`, `blocked`, `conflict`, `partial`, `cancelled`, or `superseded`. Tool errors also set MCP `isError`. Each Hearth-produced MCP response also includes bounded `arrivals` from previously detached work for the same conversation. Dispatch starts immediately and races `dispatch_inline_budget_ms` (100 ms by default); a slower operation returns `{state:"pending",future_id}` and its durable completion piggybacks on a later Hearth call without polling. Every tool also accepts the common transport hint `detach:true`, which forces that immediate future response even for a fast primitive and is stripped before primitive execution. Arrival `seq` values reflect completion order, and large detached JSON spills to artifacts.
+The seven ChatGPT-facing tools use strict operation-specific JSON Schemas. Unknown fields are rejected rather than silently discarded. `run.scatter` is deliberately closed-world: its `kind` discriminator can select only known Hearth primitives, so it cannot redispatch an arbitrary tool name plus arbitrary input. The only top-level tool that is entirely read-only is `artifact`, and it carries MCP read-only/idempotent annotations; the other six mix read and write operations, so a tool-level `readOnlyHint` would be inaccurate without splitting the public surface.
+
+Every operation returns a concise `state`: normally `completed`, `pending`, `blocked`, `conflict`, `partial`, `cancelled`, or `superseded`. Tool errors also set MCP `isError`. Each Hearth-produced MCP response also includes bounded `arrivals` from previously detached work for the same conversation. Dispatch starts immediately and races `dispatch_inline_budget_ms` (100 ms by default); a slower operation returns `{state:"pending",future_id}` and its durable completion piggybacks on a later Hearth call without polling. Every tool also accepts the common transport hint `detach:true`, which forces that immediate future response even for a fast primitive and is stripped before primitive execution. Arrival `seq` values reflect completion order, not submission order, and large detached JSON spills to artifacts. Delivery is at-least-once: a retry of the same MCP request can re-offer the previous cursor, while the next distinct request acknowledges what was offered previously. Hearth fingerprints the full request ID for this retry distinction and does not persist the raw identifier.
 
 ## Seven static tool contracts
 
@@ -45,7 +47,7 @@ Output above `max_output_bytes` has `preview` and `artifact` instead of a large 
 
 - `list`: `path`, optional `limit`
 - `read`: `path`, optional `offset`, `limit`, `encoding`
-- `search`: `path`, `query`, optional `limit`
+- `search`: `path`, `query`, optional `limit`, `max_entries`
 - `stat`: `path`
 - `write`: `path`, `data`, optional `expected_sha256` (`null` asserts the file does not exist)
 - `patch`: `path`, `replacements: [{old,new}]`, optional `expected_sha256`; every `old` must occur exactly once
@@ -55,13 +57,13 @@ Search skips symlinks and files over 2 MB. Reads and result counts are bounded.
 
 ### `task`
 
-- `submit`: either `job`/`jobs[]` for durable exec, or `calls:[{tool,input,dependencies?}]` for an immediate heterogeneous future DAG. Calls may use any existing primitive except recursive `task.submit`; integer dependencies refer to batch indexes and string dependencies to same-conversation future IDs. Exact `{$future:id-or-index,$path:"result.field"}` values resolve after their dependency completes. Returns a batch ID and future IDs immediately.
+- `submit`: `job` or `jobs[]` for durable executable work. Each job uses `command` plus optional `args`, `cwd`, `env`, `timeout_ms`, `delay_ms`/`run_at`, and `dependencies`.
 - `get`/`status`: `id`
 - `wait`: `id`, optional bounded `timeout_ms`
 - `cancel`: `id`; queued generic futures cancel atomically, while already-running generic work reports that it cannot be cancelled safely
 - `list`: optional `limit`
 
-Independent due jobs and generic calls run concurrently under separate configured caps. Failed or missing generic dependencies block dependents explicitly. Routed task status/list/wait/cancel access is isolated to the same conversation. Current ChatGPT Web safety checks may reject a request that embeds arbitrary nested tool descriptors in `task.submit(calls[])`; on ChatGPT Web prefer ordinary primitive calls with `detach:true`, while `calls[]` remains useful to pi/opencode and other MCP clients. Queued exec jobs survive restart and an interrupted durable exec job is requeued; interrupted generic work becomes `blocked` instead of replaying a possibly side-effecting call.
+Independent due jobs and generic futures run concurrently under separate configured caps. Failed or missing dependencies block dependents explicitly. Routed task status/list/wait/cancel access is isolated to the same conversation. Queued executable jobs survive restart and an interrupted durable exec job is requeued; interrupted generic work becomes `blocked` instead of replaying a possibly side-effecting call. The old open-world `calls:[{tool,input}]` descriptor is intentionally not exposed by the ChatGPT-facing MCP schema; heterogeneous orchestration is provided by the closed typed `run.scatter` contract below.
 
 ### `artifact`
 
@@ -89,14 +91,28 @@ A step is `{primitive,input}`. Allowed primitives are `machine.exec`, `fs.read`,
 
 ### `run`
 
-- `checkpoint`: optional `id`, plus `objective`, `acceptance_criteria[]`, `summary`, `next_actions[]`, `pending_task_ids[]`
-- `scatter`: `calls:[{tool,input,dependencies?}]`; an orchestration alias for the heterogeneous future DAG, intended for clients that allow nested call specs
+- `checkpoint`: optional `id`, plus `objective`, `acceptance_criteria[]`, `summary`, `next_actions[]`, `pending_task_ids[]`; pass the existing `id` to update a durable run
+- `scatter`: `calls[]` with a closed `kind` discriminated union. Current kinds cover selected `machine`, `fs`, `artifact`, semantic `ui`, and `recipe.run` primitives. Every call becomes a durable future immediately.
 - `list`, `get`, `close`
 - `schedule_continuation`: `run_id`, `prompt`, optional `delay_ms` or ISO `run_at`, optional `target: {session}` or `{browser_tab}`
 - `continuation_status`: `id`
 - `events`: optional `limit`, `entity_id`
 
-Due records are explicit. With no Oracle target they become `blocked`; with a target and default `oracle.armed: false`, they expose a safe dry-run command. Hearth stores no Oracle/API secret and does not claim an external continuation happened. Arming only changes command construction metadata in v0; execution remains an explicit machine/task operation.
+Scatter dependencies may be batch indexes or same-conversation future IDs. A typed input field may instead be an exact future reference object `{$future: index-or-id, $path: "result.field"}`; that reference also creates the dependency automatically and is resolved only after the referenced future completes. The primitive itself remains fixed by `kind`, so dataflow does not become arbitrary redispatch. For example:
+
+```json
+{
+  "operation": "scatter",
+  "calls": [
+    { "kind": "fs.stat", "path": "D:\\userdata\\docs\\projects\\hearth\\README.md" },
+    { "kind": "fs.read", "path": { "$future": 0, "$path": "result.path" }, "limit": 4096 }
+  ]
+}
+```
+
+Independent calls can finish in any order and arrive by completion sequence. A dependent call waits without polling. Missing, failed, or cross-conversation references become explicit `blocked` futures.
+
+Due continuation records are explicit. With no Oracle target they become `blocked`; with a target and default `oracle.armed: false`, they expose a safe dry-run command. Hearth stores no Oracle/API secret and does not claim an external continuation happened. Arming only changes command construction metadata in v0; execution remains an explicit machine/task operation.
 
 ## Secure MCP Tunnel hookup
 
@@ -125,4 +141,4 @@ Hearth hashes the tunnel's `openai/session` metadata with SHA-256 for mailbox ro
 npm test
 ```
 
-The tests pin MCP `2026-07-28` and exercise discovery/list/call, two clients, fs conflict/undo/containment, spill/range/search, immediate delayed/dependent/concurrent jobs, automatic and explicit detachment, async mailbox isolation/completion order/retry cursors/bounds, heterogeneous future DAGs and restart safety, routing metadata normalization, CDP route binding and bounded wake submission, recipe stats/traces/suggestions, due dry-run continuations, a bounded desktop snapshot, and a semantic invoke against a disposable WPF window. The live Secure MCP Tunnel path and ChatGPT model behavior are additionally verified manually because they require the signed-in browser environment.
+The tests pin MCP `2026-07-28` and exercise discovery/list/call, strict schema rejection, the closed scatter contract including typed future references, two clients, fs conflict/undo/containment, spill/range/search, immediate delayed/dependent/concurrent jobs, automatic and explicit detachment, async mailbox isolation/completion order/request-key retry cursors/bounds, heterogeneous future DAGs and restart safety, routing metadata normalization, CDP route binding and bounded wake submission, recipe stats/traces/suggestions, due dry-run continuations, a bounded desktop snapshot, and a semantic invoke against a disposable WPF window. The live Secure MCP Tunnel path and ChatGPT model behavior are additionally verified manually because they require the signed-in browser environment.

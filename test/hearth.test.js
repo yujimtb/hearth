@@ -48,6 +48,35 @@ test('modern MCP discovery exposes exactly seven tools and concurrent calls shar
   assert(results.every(value => structured(value).state === 'completed'));
 });
 
+test('MCP schemas reject unknown fields and expose a closed scatter envelope', async t => {
+  const { hearth, root } = await fixture(t); const handler = createHandler(hearth); t.after(() => handler.close());
+  const c = clientFor(handler, 'schema-test'); await c.client.connect(c.transport); t.after(() => c.client.close());
+  const tools = Object.fromEntries((await c.client.listTools()).tools.map(tool => [tool.name, tool]));
+  const fsVariants = tools.fs.inputSchema.anyOf || tools.fs.inputSchema.oneOf || [tools.fs.inputSchema]; assert(fsVariants.every(variant => variant.additionalProperties === false));
+  assert.match(JSON.stringify(tools.fs.inputSchema), /\"data\"/);
+  const runSchema = JSON.stringify(tools.run.inputSchema); assert.match(runSchema, /machine\.host_info/); assert.match(runSchema, /fs\.stat/); assert.match(runSchema, /\$future/); assert(!runSchema.includes('\"tool\"'));
+  const badFile = path.join(root, 'bad.txt'); let rejected = false;
+  try { const result = await c.client.callTool({ name: 'fs', arguments: { operation: 'write', path: badFile, content: 'must-not-write' } }); rejected = Boolean(result.isError); } catch { rejected = true; }
+  assert.equal(rejected, true); await assert.rejects(() => readFile(badFile));
+  rejected = false; try { const result = await c.client.callTool({ name: 'run', arguments: { operation: 'checkpoint', run_id: 'wrong-field', objective: 'x' } }); rejected = Boolean(result.isError); } catch { rejected = true; }
+  assert.equal(rejected, true);
+});
+
+test('MCP closed scatter accepts typed future references and executes the dependency DAG', async t => {
+  const { hearth, root } = await fixture(t); const file = path.join(root, 'scatter-ref.txt'); await writeFile(file, 'scatter-ref');
+  const handler = createHandler(hearth); t.after(() => handler.close());
+  const c = clientFor(handler, 'scatter-ref-schema'); await c.client.connect(c.transport); t.after(() => c.client.close());
+  const first = structured(await c.client.callTool({ name: 'run', arguments: { operation: 'scatter', calls: [
+    { kind: 'fs.stat', path: file },
+    { kind: 'fs.read', path: { $future: 0, $path: 'result.path' } }
+  ] } }));
+  assert.equal(first.state, 'pending'); assert.equal(first.futures.length, 2);
+  await waitFor(() => first.futures.every(item => ['completed','blocked'].includes(hearth.db.prepare('SELECT state FROM futures WHERE id=?').get(item.id)?.state)));
+  const dependency = hearth.db.prepare('SELECT state,result,error FROM futures WHERE id=?').get(first.futures[1].id);
+  assert.equal(dependency.state, 'completed', dependency.error || 'dependent future should complete');
+  assert.equal(JSON.parse(dependency.result).data, 'scatter-ref');
+});
+
 test('localhost /mcp serves modern discovery and rejects foreign Origin', async t => {
   const base = await mkdtemp(path.join(os.tmpdir(), 'hearth-http-')); const root = path.join(base, 'root'); await mkdir(root);
   const configFile = path.join(base, 'config.json');
@@ -160,6 +189,13 @@ test('same turn retries re-offer the prior cursor before a new turn acknowledges
   const first = structured(await hearth.dispatch('machine', { operation: 'host_info' }, route)); assert.equal(first.arrivals[0].future_id, 'retry-future');
   const retry = structured(await hearth.dispatch('machine', { operation: 'host_info' }, route)); assert.equal(retry.arrivals[0].future_id, 'retry-future'); assert.equal(retry.arrivals[0].seq, first.arrivals[0].seq);
   const next = structured(await hearth.dispatch('machine', { operation: 'host_info' }, { ...route, turn_key: 'turn-two' })); assert.deepEqual(next.arrivals, []);
+});
+
+test('same turn distinct request keys acknowledge the prior offer', async t => {
+  const { hearth } = await fixture(t); const base = { conversation_key: 'test:req-key', source: 'local', turn_key: 'same-turn' }; hearth.ensureMailbox(base); const at = new Date().toISOString();
+  hearth.db.prepare("INSERT INTO futures(id,route_key,kind,tool,dependencies,state,detached,at,updated_at,completed_at,result,mailbox_seq) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").run('request-key-future', base.conversation_key, 'generic', 'machine', '[]', 'completed', 1, at, at, at, '{\"state\":\"completed\"}', 1);
+  const first = structured(await hearth.dispatch('machine', { operation: 'host_info' }, { ...base, request_key: 'request-a' })); assert.equal(first.arrivals.length, 1);
+  const second = structured(await hearth.dispatch('machine', { operation: 'host_info' }, { ...base, request_key: 'request-b' })); assert.deepEqual(second.arrivals, []);
 });
 
 test('mailbox bounds arrivals and spills oversized detached JSON to artifact', async t => {
@@ -384,7 +420,7 @@ test('Windows UIA invokes only the disposable fixture button', { skip: process.p
   assert.match(snapshot.state, /completed|partial/);
   const button = snapshot.tree.children.find(node => node.automationId === 'HearthInvokeButton');
   assert(button); assert(button.patterns.includes('invoke'));
-  const invoked = await hearth.ui({ operation: 'action', hwnd: ready.hwnd, target: { automation_id: 'HearthInvokeButton' }, action: 'invoke' });
+  const invoked = await hearth.ui({ operation: 'action', hwnd: ready.hwnd, target: { automation_id: 'HearthInvokeButton', control_type: 'Button' }, action: 'invoke' });
   assert.equal(invoked.state, 'completed'); assert.equal(invoked.method, 'uia.invoke');
   assert.equal(await waitFor(async () => { try { return (await readFile(actionFile, 'utf8')).trim(); } catch { return null; } }), 'invoked');
 });
@@ -439,8 +475,8 @@ test('run.scatter exposes heterogeneous future DAGs through the orchestration to
   const { hearth, root } = await fixture(t); const file = path.join(root, 'scatter.txt'); await writeFile(file, 'scatter');
   const route = { conversation_key: 'local:run-scatter', source: 'local', turn_key: 'turn-a' };
   const first = structured(await hearth.dispatch('run', { operation: 'scatter', calls: [
-    { tool: 'machine', input: { operation: 'host_info' } },
-    { tool: 'fs', input: { operation: 'stat', path: file } }
+    { kind: 'machine.host_info' },
+    { kind: 'fs.stat', path: file }
   ] }, route));
   assert.equal(first.state, 'pending'); assert.equal(first.futures.length, 2);
   await waitFor(() => first.futures.every(item => hearth.db.prepare('SELECT state FROM futures WHERE id=?').get(item.id)?.state === 'completed'));

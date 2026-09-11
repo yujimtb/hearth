@@ -101,7 +101,7 @@ export class Hearth {
       CREATE TABLE IF NOT EXISTS traces(id INTEGER PRIMARY KEY, at TEXT NOT NULL, trace_id TEXT NOT NULL, position INTEGER NOT NULL, operation TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, at TEXT NOT NULL, updated_at TEXT NOT NULL, state TEXT NOT NULL, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS continuations(id TEXT PRIMARY KEY, run_id TEXT NOT NULL, at TEXT NOT NULL, due_at TEXT NOT NULL, state TEXT NOT NULL, target TEXT, prompt TEXT NOT NULL, result TEXT, FOREIGN KEY(run_id) REFERENCES runs(id));
-      CREATE TABLE IF NOT EXISTS mailboxes(route_key TEXT PRIMARY KEY, source TEXT NOT NULL, ack_seq INTEGER NOT NULL DEFAULT 0, offered_seq INTEGER NOT NULL DEFAULT 0, last_turn_key TEXT, last_activity_at TEXT NOT NULL, probe_nonce TEXT UNIQUE, probe_expires_at TEXT, probe_next_at TEXT, target_id TEXT, target_url TEXT, bound_at TEXT, wake_due_at TEXT, wake_attempts INTEGER NOT NULL DEFAULT 0, wake_cursor INTEGER NOT NULL DEFAULT 0, last_wake_at TEXT, wake_claimed_at TEXT);
+      CREATE TABLE IF NOT EXISTS mailboxes(route_key TEXT PRIMARY KEY, source TEXT NOT NULL, ack_seq INTEGER NOT NULL DEFAULT 0, offered_seq INTEGER NOT NULL DEFAULT 0, last_turn_key TEXT, last_request_key TEXT, last_activity_at TEXT NOT NULL, probe_nonce TEXT UNIQUE, probe_expires_at TEXT, probe_next_at TEXT, target_id TEXT, target_url TEXT, bound_at TEXT, wake_due_at TEXT, wake_attempts INTEGER NOT NULL DEFAULT 0, wake_cursor INTEGER NOT NULL DEFAULT 0, last_wake_at TEXT, wake_claimed_at TEXT);
       CREATE TABLE IF NOT EXISTS futures(id TEXT PRIMARY KEY, batch_id TEXT, route_key TEXT NOT NULL, kind TEXT NOT NULL, tool TEXT, input TEXT, dependencies TEXT NOT NULL DEFAULT '[]', state TEXT NOT NULL, detached INTEGER NOT NULL DEFAULT 1, at TEXT NOT NULL, updated_at TEXT NOT NULL, started_at TEXT, completed_at TEXT, result TEXT, error TEXT, mailbox_seq INTEGER, FOREIGN KEY(route_key) REFERENCES mailboxes(route_key), UNIQUE(route_key,mailbox_seq));
       CREATE INDEX IF NOT EXISTS idx_jobs_state_run ON jobs(state, run_at);
       CREATE INDEX IF NOT EXISTS idx_cont_state_due ON continuations(state, due_at);
@@ -109,6 +109,8 @@ export class Hearth {
       CREATE INDEX IF NOT EXISTS idx_futures_state ON futures(state,at);
       CREATE INDEX IF NOT EXISTS idx_futures_batch ON futures(batch_id);
       CREATE INDEX IF NOT EXISTS idx_futures_mailbox ON futures(route_key,mailbox_seq);`);
+    const mailboxColumns = new Set(this.db.prepare('PRAGMA table_info(mailboxes)').all().map(row => row.name));
+    if (!mailboxColumns.has('last_request_key')) this.db.exec('ALTER TABLE mailboxes ADD COLUMN last_request_key TEXT');
     this.db.prepare("UPDATE jobs SET state='queued', updated_at=? WHERE state='running'").run(now());
     const interrupted = this.db.prepare("SELECT id FROM futures WHERE kind IN ('dispatch','generic') AND state='running'").all();
     this.db.prepare("UPDATE futures SET detached=1 WHERE kind IN ('dispatch','generic') AND state='running'").run();
@@ -339,8 +341,12 @@ export class Hearth {
   }
 
   beginRequest(routing) {
-    const routeKey = this.ensureMailbox(routing); const row = this.db.prepare('SELECT ack_seq,offered_seq,last_turn_key FROM mailboxes WHERE route_key=?').get(routeKey); const retry = Boolean(routing?.turn_key && row.last_turn_key === routing.turn_key); const nextAck = retry ? row.ack_seq : row.offered_seq;
-    this.db.prepare('UPDATE mailboxes SET ack_seq=?,last_turn_key=?,last_activity_at=?,wake_due_at=NULL,wake_attempts=0,wake_claimed_at=NULL,offered_seq=? WHERE route_key=?').run(nextAck, routing?.turn_key || null, now(), nextAck, routeKey);
+    const routeKey = this.ensureMailbox(routing);
+    const row = this.db.prepare('SELECT ack_seq,offered_seq,last_turn_key,last_request_key FROM mailboxes WHERE route_key=?').get(routeKey);
+    const requestKey = routing?.request_key || routing?.turn_key || null;
+    const retry = Boolean(requestKey && row.last_request_key === requestKey);
+    const nextAck = retry ? row.ack_seq : row.offered_seq;
+    this.db.prepare('UPDATE mailboxes SET ack_seq=?,last_turn_key=?,last_request_key=?,last_activity_at=?,wake_due_at=NULL,wake_attempts=0,wake_claimed_at=NULL,offered_seq=? WHERE route_key=?').run(nextAck, routing?.turn_key || null, requestKey, now(), nextAck, routeKey);
     return routeKey;
   }
 
@@ -705,8 +711,26 @@ export class Hearth {
     return { state: 'pending', due: true, dry_run: false, command: this.config.oracle.command, args, reason: 'armed adapter command is exposed for explicit execution; no secrets are stored' };
   }
 
+  scatterCalls(calls) {
+    return calls.map(call => {
+      const { kind, dependencies, ...rest } = call;
+      const withDeps = value => ({ ...value, ...(dependencies && { dependencies }) });
+      if (kind === 'machine.host_info') return withDeps({ tool: 'machine', input: { operation: 'host_info' } });
+      if (kind === 'machine.process_list') return withDeps({ tool: 'machine', input: { operation: 'process_list' } });
+      if (kind === 'machine.exec') return withDeps({ tool: 'machine', input: { operation: 'exec', ...rest } });
+      if (kind.startsWith('fs.')) return withDeps({ tool: 'fs', input: { operation: kind.slice(3), ...rest } });
+      if (kind === 'artifact.metadata') return withDeps({ tool: 'artifact', input: { operation: 'metadata', ...rest } });
+      if (kind === 'artifact.read') return withDeps({ tool: 'artifact', input: { operation: 'read', ...rest } });
+      if (kind === 'artifact.search') return withDeps({ tool: 'artifact', input: { operation: 'search', ...rest } });
+      if (kind === 'ui.query') return withDeps({ tool: 'ui', input: { operation: 'query', ...rest } });
+      if (kind === 'ui.action') return withDeps({ tool: 'ui', input: { operation: 'action', ...rest } });
+      if (kind === 'recipe.run') return withDeps({ tool: 'recipe', input: { operation: 'run', ...rest } });
+      throw new Error(`unsupported scatter kind: ${kind}`);
+    });
+  }
+
   async run(input, routing) {
-    if (input.operation === 'scatter') return this.submitCalls(input.calls, routing);
+    if (input.operation === 'scatter') return this.submitCalls(this.scatterCalls(input.calls), routing);
     if (input.operation === 'checkpoint') {
       const id = input.id || randomUUID(); const existing = this.db.prepare('SELECT state,at FROM runs WHERE id=?').get(id); const body = { objective: input.objective, acceptance_criteria: input.acceptance_criteria || [], summary: input.summary || '', next_actions: input.next_actions || [], pending_task_ids: input.pending_task_ids || [] }; assertNoSecrets(body); const at = now();
       if (existing) this.db.prepare("UPDATE runs SET updated_at=?,state='open',body=? WHERE id=?").run(at, json(body), id); else this.db.prepare("INSERT INTO runs(id,at,updated_at,state,body) VALUES(?,?,?,?,?)").run(id, at, at, 'open', json(body));
