@@ -23,7 +23,7 @@ Data defaults to `.hearth/hearth.db`, with artifacts and backups beside it. Keep
 
 `src/server.js` mounts the MCP v2 `createMcpHandler` through the Node HTTP adapter. This supplies MCP 2026-07-28 `server/discover` and modern stateless calls while retaining the SDK's stateless legacy fallback. Each request gets a cheap `McpServer`; `src/hearth.js` owns shared SQLite and services.
 
-Commands use direct executable/argv spawning (`shell: false`), bounded timeout and output, and a configurable concurrency cap. Large output spills to an artifact. Files must remain under configured roots after real-path/symlink checks. Writes and patches use same-directory temporary files plus rename, require an optional `expected_sha256`, and produce durable undo receipts. UI work is globally serialized and goes through a bounded STA PowerShell UIA bridge; fallback input is off unless `allow_fallback` is explicitly true and the request scopes it to an `hwnd` or `process_id`.
+Commands use direct executable/argv spawning (`shell: false`), bounded timeout and output, and a configurable concurrency cap. Large output spills to an artifact. Files must remain under configured roots after real-path/symlink checks. Writes, patches, and undo restore through same-directory temporary files plus rename, require an optional `expected_sha256`, and produce durable undo receipts. Transient Windows `EPERM`, `EACCES`, and `EBUSY` rename failures are retried with bounded exponential backoff; a recovered mutation reports `replace_attempts`. UI work is globally serialized and goes through a bounded STA PowerShell UIA bridge; fallback input is off unless `allow_fallback` is explicitly true and the request scopes it to an `hwnd` or `process_id`.
 
 The seven ChatGPT-facing tools use strict operation-specific JSON Schemas. Unknown fields are rejected rather than silently discarded. `run.scatter` is deliberately closed-world: its `kind` discriminator can select only known Hearth primitives, so it cannot redispatch an arbitrary tool name plus arbitrary input. The only top-level tool that is entirely read-only is `artifact`, and it carries MCP read-only/idempotent annotations; the other six mix read and write operations, so a tool-level `readOnlyHint` would be inaccurate without splitting the public surface.
 
@@ -92,7 +92,7 @@ A step is `{primitive,input}`. Allowed primitives are `machine.exec`, `fs.read`,
 ### `run`
 
 - `checkpoint`: optional `id`, plus `objective`, `acceptance_criteria[]`, `summary`, `next_actions[]`, `pending_task_ids[]`; pass the existing `id` to update a durable run
-- `scatter`: `calls[]` with a closed `kind` discriminated union. Current kinds cover selected `machine`, `fs`, `artifact`, semantic `ui`, and `recipe.run` primitives. Every call becomes a durable future immediately.
+- `scatter`: `calls[]` with a closed `kind` discriminated union. Current kinds cover selected `machine`, `fs`, `artifact`, semantic `ui`, `recipe.run`, plus read-only `task.get/status/list` and `run.get/list/events` diagnostics. Every call becomes a durable future immediately.
 - `list`, `get`, `close`
 - `schedule_continuation`: `run_id`, `prompt`, optional `delay_ms` or ISO `run_at`, optional `target: {session}` or `{browser_tab}`
 - `continuation_status`: `id`
@@ -110,9 +110,21 @@ Scatter dependencies may be batch indexes or same-conversation future IDs. A typ
 }
 ```
 
-Independent calls can finish in any order and arrive by completion sequence. A dependent call waits without polling. Missing, failed, or cross-conversation references become explicit `blocked` futures.
+Independent calls can finish in any order and arrive by completion sequence. A dependent call waits without polling. Missing, failed, or cross-conversation references become explicit `blocked` futures. The read-only diagnostic kinds are intended for failure handling: one scatter can collect host/process state, files, artifacts, task/future state, durable run state, and events without a chain of explicit polling calls.
 
 Due continuation records are explicit. With no Oracle target they become `blocked`; with a target and default `oracle.armed: false`, they expose a safe dry-run command. Hearth stores no Oracle/API secret and does not claim an external continuation happened. Arming only changes command construction metadata in v0; execution remains an explicit machine/task operation.
+
+## Windows runtime resilience
+
+Hearth can be kept in the interactive user session with the included supervisor and Scheduled Task installer. This deliberately avoids a Session 0 service because UI Automation must stay attached to the logged-in desktop.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-autostart.ps1 -StartNow
+```
+
+The `Hearth-Runtime` task starts at logon as the current interactive user. `scripts\supervise-hearth.ps1` observes the configured localhost port, leaves an already-running Hearth alone, starts `node src/server.js` when the port becomes free, and restarts the server after an unexpected exit. Operational logs go under `.hearth\logs` and remain gitignored. The task itself also has Task Scheduler restart-on-failure settings. Remove it with `scripts\install-autostart.ps1 -Uninstall`.
+
+This supervisor contains no tunnel credential. For Secure MCP Tunnel sessions where the runtime key must not be stored, `run-tunnel-from-clipboard.ps1` reads the key once from the Windows clipboard, clears the clipboard by default, puts the key only in the process environment, runs `tunnel-client doctor`, and restarts a failed `tunnel-client run` with bounded backoff. A reboot or full logoff still requires supplying the runtime key again; Hearth does not persist it.
 
 ## Secure MCP Tunnel hookup
 
@@ -131,7 +143,7 @@ tunnel-client doctor --profile hearth-local --explain
 tunnel-client run --profile hearth-local
 ```
 
-Then enable ChatGPT developer mode, open Plugins, create an app, select **Tunnel**, and choose/paste that tunnel ID. Keep both Hearth and `tunnel-client` running. Never place the runtime key in Hearth config. This tunnel is for private/developer use, not public plugin submission.
+Then enable ChatGPT developer mode, open Plugins, create an app, select **Tunnel**, and choose/paste that tunnel ID. Keep both Hearth and `tunnel-client` running. Never place the runtime key in Hearth config. If the tunnel profile is already initialized, you may instead put the runtime key on the clipboard and run `powershell -NoProfile -ExecutionPolicy Bypass -File .\run-tunnel-from-clipboard.ps1`; the helper does not write the key to disk. This tunnel is for private/developer use, not public plugin submission.
 
 Hearth hashes the tunnel's `openai/session` metadata with SHA-256 for mailbox routing and never passes raw OpenAI session, subject, organization, or request identifiers into persistence. Anonymous local stateless requests receive isolated request-scoped routes; local clients that need cross-request delivery can send `hearth/conversation` metadata. An early pending OpenAI response may include a reusable expiring `route_probe` nonce. The built-in loopback-only CDP binder can map that exact nonce to one unique ChatGPT tab with a stable `/c/<id>` conversation URL and persists only the route fingerprint, target ID, and stable conversation URL. Automatic wake is implemented but disabled by default; set `wake.armed:true` to enable it. It uses the already-bound loopback CDP target directly and does not require `oracle.armed`. When armed, Hearth wakes only a bound quiet conversation with undelivered terminal arrivals, using debounce, cooldown, and attempt limits; pending work alone never wakes a tab. The wake prompt asks ChatGPT to make one known-safe `machine.host_info` call, whose normal response piggybacks the ready arrivals, then continue the prior task from them. Oracle remains separate for explicitly scheduled continuation records.
 
@@ -141,4 +153,4 @@ Hearth hashes the tunnel's `openai/session` metadata with SHA-256 for mailbox ro
 npm test
 ```
 
-The tests pin MCP `2026-07-28` and exercise discovery/list/call, strict schema rejection, the closed scatter contract including typed future references, two clients, fs conflict/undo/containment, spill/range/search, immediate delayed/dependent/concurrent jobs, automatic and explicit detachment, async mailbox isolation/completion order/request-key retry cursors/bounds, heterogeneous future DAGs and restart safety, routing metadata normalization, CDP route binding and bounded wake submission, recipe stats/traces/suggestions, due dry-run continuations, a bounded desktop snapshot, and a semantic invoke against a disposable WPF window. The live Secure MCP Tunnel path and ChatGPT model behavior are additionally verified manually because they require the signed-in browser environment.
+The tests pin MCP `2026-07-28` and exercise discovery/list/call, strict schema rejection, the closed scatter contract including typed future references and read-only runtime diagnostics, two clients, fs conflict/undo/containment, transient atomic-replace retry injection, spill/range/search, immediate delayed/dependent/concurrent jobs, automatic and explicit detachment, async mailbox isolation/completion order/request-key retry cursors/bounds, heterogeneous future DAGs and restart safety, routing metadata normalization, CDP route binding and bounded wake submission, recipe stats/traces/suggestions, due dry-run continuations, a bounded desktop snapshot, and a semantic invoke against a disposable WPF window. The live Secure MCP Tunnel path, ChatGPT model behavior, and Windows supervisor crash-recovery path are additionally verified manually because they require the signed-in interactive environment.

@@ -271,6 +271,20 @@ export class Hearth {
 
   async fileHash(file) { try { return sha256(await fs.readFile(file)); } catch (error) { if (error.code === 'ENOENT') return null; throw error; } }
 
+  async renameFile(source, target) { return fs.rename(source, target); }
+
+  async replaceFile(source, target) {
+    const retryable = new Set(['EPERM','EACCES','EBUSY']);
+    for (let attempt = 0; ; attempt++) {
+      try { await this.renameFile(source, target); return attempt + 1; }
+      catch (error) {
+        if (!retryable.has(error.code) || attempt >= 5) throw error;
+        this.event('fs.rename_retry', null, { target, code: error.code, attempt: attempt + 1 });
+        await sleep(10 * (2 ** attempt));
+      }
+    }
+  }
+
   async mutateFile(target, data, expected) {
     const operation = async () => {
       const file = await this.safePath(target);
@@ -280,11 +294,12 @@ export class Hearth {
       if (before) { backup = path.join(this.config.data_dir, 'backups', receiptId); await fs.copyFile(file, backup); }
       await fs.mkdir(path.dirname(file), { recursive: true });
       const temp = path.join(path.dirname(file), `.${path.basename(file)}.${randomUUID()}.tmp`);
-      try { await fs.writeFile(temp, data); await fs.rename(temp, file); } catch (error) { await fs.rm(temp, { force: true }); throw error; }
+      let replaceAttempts;
+      try { await fs.writeFile(temp, data); replaceAttempts = await this.replaceFile(temp, file); } catch (error) { await fs.rm(temp, { force: true }); throw error; }
       const after = await this.fileHash(file);
       this.db.prepare('INSERT INTO receipts(id,at,target,backup,before_sha256,after_sha256) VALUES(?,?,?,?,?,?)').run(receiptId, now(), file, backup, before, after);
       this.event('fs.mutated', receiptId, { target: file, before, after });
-      return { state: 'completed', path: file, sha256: after, receipt: { id: receiptId, operation: 'undo' } };
+      return { state: 'completed', path: file, sha256: after, receipt: { id: receiptId, operation: 'undo' }, ...(replaceAttempts > 1 && { replace_attempts: replaceAttempts }) };
     };
     const promise = this.fsTail.then(operation, operation); this.fsTail = promise.catch(() => {}); return promise;
   }
@@ -320,12 +335,13 @@ export class Hearth {
         if (row.undone_at) return { state: 'superseded', receipt_id: row.id, undone_at: row.undone_at };
         const current = await this.fileHash(row.target);
         if (current !== row.after_sha256) return { state: 'conflict', expected_sha256: row.after_sha256, actual_sha256: current };
+        let replaceAttempts;
         if (row.backup) {
           const temp = path.join(path.dirname(row.target), `.${path.basename(row.target)}.${randomUUID()}.tmp`);
-          try { await fs.copyFile(row.backup, temp); await fs.rename(temp, row.target); } catch (error) { await fs.rm(temp, { force: true }); throw error; }
+          try { await fs.copyFile(row.backup, temp); replaceAttempts = await this.replaceFile(temp, row.target); } catch (error) { await fs.rm(temp, { force: true }); throw error; }
         } else await fs.unlink(row.target);
         const at = now(); this.db.prepare('UPDATE receipts SET undone_at=? WHERE id=?').run(at, row.id); this.event('fs.undo', row.id, { target: row.target });
-        return { state: 'completed', receipt_id: row.id, sha256: await this.fileHash(row.target) };
+        return { state: 'completed', receipt_id: row.id, sha256: await this.fileHash(row.target), ...(replaceAttempts > 1 && { replace_attempts: replaceAttempts }) };
       };
       const promise = this.fsTail.then(operation, operation); this.fsTail = promise.catch(() => {}); return promise;
     }
@@ -719,9 +735,12 @@ export class Hearth {
       if (kind === 'machine.process_list') return withDeps({ tool: 'machine', input: { operation: 'process_list' } });
       if (kind === 'machine.exec') return withDeps({ tool: 'machine', input: { operation: 'exec', ...rest } });
       if (kind.startsWith('fs.')) return withDeps({ tool: 'fs', input: { operation: kind.slice(3), ...rest } });
+      if (kind === 'artifact.list') return withDeps({ tool: 'artifact', input: { operation: 'list', ...rest } });
       if (kind === 'artifact.metadata') return withDeps({ tool: 'artifact', input: { operation: 'metadata', ...rest } });
       if (kind === 'artifact.read') return withDeps({ tool: 'artifact', input: { operation: 'read', ...rest } });
       if (kind === 'artifact.search') return withDeps({ tool: 'artifact', input: { operation: 'search', ...rest } });
+      if (['task.get','task.status','task.list'].includes(kind)) return withDeps({ tool: 'task', input: { operation: kind.slice(5), ...rest } });
+      if (['run.get','run.list','run.events'].includes(kind)) return withDeps({ tool: 'run', input: { operation: kind.slice(4), ...rest } });
       if (kind === 'ui.query') return withDeps({ tool: 'ui', input: { operation: 'query', ...rest } });
       if (kind === 'ui.action') return withDeps({ tool: 'ui', input: { operation: 'action', ...rest } });
       if (kind === 'recipe.run') return withDeps({ tool: 'recipe', input: { operation: 'run', ...rest } });

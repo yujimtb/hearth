@@ -54,7 +54,7 @@ test('MCP schemas reject unknown fields and expose a closed scatter envelope', a
   const tools = Object.fromEntries((await c.client.listTools()).tools.map(tool => [tool.name, tool]));
   const fsVariants = tools.fs.inputSchema.anyOf || tools.fs.inputSchema.oneOf || [tools.fs.inputSchema]; assert(fsVariants.every(variant => variant.additionalProperties === false));
   assert.match(JSON.stringify(tools.fs.inputSchema), /\"data\"/);
-  const runSchema = JSON.stringify(tools.run.inputSchema); assert.match(runSchema, /machine\.host_info/); assert.match(runSchema, /fs\.stat/); assert.match(runSchema, /\$future/); assert(!runSchema.includes('\"tool\"'));
+  const runSchema = JSON.stringify(tools.run.inputSchema); assert.match(runSchema, /machine\.host_info/); assert.match(runSchema, /fs\.stat/); assert.match(runSchema, /task\.list/); assert.match(runSchema, /run\.events/); assert.match(runSchema, /\$future/); assert(!runSchema.includes('\"tool\"'));
   const badFile = path.join(root, 'bad.txt'); let rejected = false;
   try { const result = await c.client.callTool({ name: 'fs', arguments: { operation: 'write', path: badFile, content: 'must-not-write' } }); rejected = Boolean(result.isError); } catch { rejected = true; }
   assert.equal(rejected, true); await assert.rejects(() => readFile(badFile));
@@ -133,6 +133,21 @@ test('filesystem serializes concurrent patch computation and undo checks', async
   const write = hearth.fsTool({ operation: 'write', path: file, data: 'later', expected_sha256: done.sha256 });
   assert.deepEqual((await Promise.all([undo, write])).map(result => result.state), ['completed', 'conflict']);
   assert.equal(await readFile(file, 'utf8'), 'x');
+});
+test('filesystem retries transient atomic replace failures for mutation and undo', async t => {
+  const { hearth, root } = await fixture(t); const file = path.join(root, 'rename-retry.txt'); await writeFile(file, 'before');
+  const realRename = hearth.renameFile.bind(hearth);
+  const inject = count => {
+    let remaining = count; let attempts = 0;
+    hearth.renameFile = async (...args) => { attempts++; if (remaining-- > 0) { const error = new Error('transient file lock'); error.code = 'EPERM'; throw error; } return realRename(...args); };
+    return () => attempts;
+  };
+  const mutationAttempts = inject(2);
+  const changed = await hearth.fsTool({ operation: 'patch', path: file, replacements: [{ old: 'before', new: 'after' }] });
+  assert.equal(changed.state, 'completed'); assert.equal(changed.replace_attempts, 3); assert.equal(mutationAttempts(), 3); assert.equal(await readFile(file, 'utf8'), 'after');
+  const undoAttempts = inject(1);
+  const undone = await hearth.fsTool({ operation: 'undo', receipt_id: changed.receipt.id });
+  assert.equal(undone.state, 'completed'); assert.equal(undone.replace_attempts, 2); assert.equal(undoAttempts(), 2); assert.equal(await readFile(file, 'utf8'), 'before');
 });
 
 test('durable delayed and dependent tasks return immediately, run concurrently, and recover', async t => {
@@ -483,4 +498,22 @@ test('run.scatter exposes heterogeneous future DAGs through the orchestration to
   const second = structured(await hearth.dispatch('machine', { operation: 'host_info' }, { ...route, turn_key: 'turn-b' }));
   const delivered = [...(first.arrivals || []), ...second.arrivals].map(item => item.future_id);
   assert.deepEqual(new Set(delivered), new Set(first.futures.map(item => item.id)));
+});
+test('closed scatter batches read-only runtime diagnostics through the MCP schema', async t => {
+  const { hearth } = await fixture(t); const handler = createHandler(hearth); t.after(() => handler.close());
+  const c = clientFor(handler, 'diagnostic-scatter'); await c.client.connect(c.transport); t.after(() => c.client.close());
+  const checkpoint = structured(await c.client.callTool({ name: 'run', arguments: { operation: 'checkpoint', objective: 'diagnostic scatter' } }));
+  const first = structured(await c.client.callTool({ name: 'run', arguments: { operation: 'scatter', calls: [
+    { kind: 'artifact.list', limit: 2 },
+    { kind: 'task.list', limit: 8 },
+    { kind: 'run.get', id: checkpoint.id },
+    { kind: 'run.events', entity_id: checkpoint.id, limit: 8 }
+  ] } }));
+  assert.equal(first.state, 'pending'); assert.equal(first.futures.length, 4);
+  await waitFor(() => first.futures.every(item => hearth.db.prepare('SELECT state FROM futures WHERE id=?').get(item.id)?.state === 'completed'));
+  const results = first.futures.map(item => JSON.parse(hearth.db.prepare('SELECT result FROM futures WHERE id=?').get(item.id).result));
+  assert.equal(results[0].state, 'completed'); assert(Array.isArray(results[0].artifacts));
+  assert.equal(results[1].state, 'completed'); assert(Array.isArray(results[1].futures));
+  assert.equal(results[2].state, 'completed'); assert.equal(results[2].run.id, checkpoint.id);
+  assert.equal(results[3].state, 'completed'); assert(results[3].events.some(event => event.entity_id === checkpoint.id));
 });
