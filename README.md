@@ -114,17 +114,20 @@ Independent calls can finish in any order and arrive by completion sequence. A d
 
 Due continuation records are explicit. With no Oracle target they become `blocked`; with a target and default `oracle.armed: false`, they expose a safe dry-run command. Hearth stores no Oracle/API secret and does not claim an external continuation happened. Arming only changes command construction metadata in v0; execution remains an explicit machine/task operation.
 
-## Windows runtime resilience
+## Windows unattended recovery
 
-Hearth can be kept in the interactive user session with the included supervisor and Scheduled Task installer. This deliberately avoids a Session 0 service because UI Automation must stay attached to the logged-in desktop.
+The canonical Windows recovery path uses short periodic Task Scheduler checks rather than a long-lived supervisor process. This avoids depending on a PowerShell parent process surviving indefinitely. Because UI Automation must remain in the logged-in interactive desktop, the tasks run as the current interactive user rather than as a Session 0 service.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-autostart.ps1 -StartNow
-```
+For a command-free setup, double-click `Hearth-Tunnel-Setup.cmd`. The small Windows UI accepts the OpenAI Tunnel runtime key once, protects it with Windows DPAPI `CurrentUser`, locks the credential file ACL to the current user plus SYSTEM, installs the recovery tasks, and verifies Tunnel readiness. The plaintext key is not written to disk and the clipboard is cleared after saving.
 
-The `Hearth-Runtime` task starts at logon as the current interactive user. `scripts\supervise-hearth.ps1` observes the configured localhost port, leaves an already-running Hearth alone, starts `node src/server.js` when the port becomes free, and restarts the server after an unexpected exit. Operational logs go under `.hearth\logs` and remain gitignored. The task itself also has Task Scheduler restart-on-failure settings. Remove it with `scripts\install-autostart.ps1 -Uninstall`.
+Two tasks are installed:
 
-This supervisor contains no tunnel credential. For Secure MCP Tunnel sessions where the runtime key must not be stored, `run-tunnel-from-clipboard.ps1` reads the key once from the Windows clipboard, clears the clipboard by default, puts the key only in the process environment, runs `tunnel-client doctor`, and restarts a failed `tunnel-client run` with bounded backoff. A reboot or full logoff still requires supplying the runtime key again; Hearth does not persist it.
+- `Hearth-Runtime-Ensure` runs at logon and every minute. `scripts\ensure-hearth.ps1` checks the configured localhost port and starts `node src/server.js` only when Hearth is missing.
+- `Hearth-Tunnel` runs at logon and every minute. `scripts\ensure-tunnel.ps1` checks `/readyz` and, when the Tunnel is missing, decrypts `.hearth\secrets\hearth-tunnel.dpapi` only in memory and launches `tunnel-client run --profile hearth-local`.
+
+Both ensure operations are short-lived; a normal Task state is therefore `Ready`, not permanently `Running`. `MultipleInstances=IgnoreNew` prevents overlapping checks. Operational logs and the DPAPI credential stay under the gitignored `.hearth` directory. A full Windows reboot needs no Tunnel key re-entry after the user session logs on. Pre-login GUI operation is intentionally unsupported because Windows UI Automation cannot operate the interactive desktop before that session exists.
+
+The older `scripts\supervise-hearth.ps1` and `run-tunnel-from-clipboard.ps1` remain as compatibility/manual fallback paths, but they are not required for unattended recovery.
 
 ## Secure MCP Tunnel hookup
 
@@ -143,7 +146,7 @@ tunnel-client doctor --profile hearth-local --explain
 tunnel-client run --profile hearth-local
 ```
 
-Then enable ChatGPT developer mode, open Plugins, create an app, select **Tunnel**, and choose/paste that tunnel ID. Keep both Hearth and `tunnel-client` running. Never place the runtime key in Hearth config. If the tunnel profile is already initialized, you may instead put the runtime key on the clipboard and run `powershell -NoProfile -ExecutionPolicy Bypass -File .\run-tunnel-from-clipboard.ps1`; the helper does not write the key to disk. This tunnel is for private/developer use, not public plugin submission.
+Then enable ChatGPT developer mode, open Plugins, create an app, select **Tunnel**, and choose/paste that tunnel ID. Never place the runtime key in Hearth config or the tunnel profile itself. On Windows, use `Hearth-Tunnel-Setup.cmd` once to store the key with DPAPI and enable unattended recovery. `run-tunnel-from-clipboard.ps1` remains available as a non-persistent manual fallback. This tunnel is for private/developer use, not public plugin submission.
 
 Hearth hashes the tunnel's `openai/session` metadata with SHA-256 for mailbox routing and never passes raw OpenAI session, subject, organization, or request identifiers into persistence. Anonymous local stateless requests receive isolated request-scoped routes; local clients that need cross-request delivery can send `hearth/conversation` metadata. An early pending OpenAI response may include a reusable expiring `route_probe` nonce. The built-in loopback-only CDP binder can map that exact nonce to one unique ChatGPT tab with a stable `/c/<id>` conversation URL and persists only the route fingerprint, target ID, and stable conversation URL. Automatic wake is implemented but disabled by default; set `wake.armed:true` to enable it. It uses the already-bound loopback CDP target directly and does not require `oracle.armed`. When armed, Hearth wakes only a bound quiet conversation with undelivered terminal arrivals, using debounce, cooldown, and attempt limits; pending work alone never wakes a tab. The wake prompt asks ChatGPT to make one known-safe `machine.host_info` call, whose normal response piggybacks the ready arrivals, then continue the prior task from them. Oracle remains separate for explicitly scheduled continuation records.
 
@@ -153,4 +156,4 @@ Hearth hashes the tunnel's `openai/session` metadata with SHA-256 for mailbox ro
 npm test
 ```
 
-The tests pin MCP `2026-07-28` and exercise discovery/list/call, strict schema rejection, the closed scatter contract including typed future references and read-only runtime diagnostics, two clients, fs conflict/undo/containment, transient atomic-replace retry injection, spill/range/search, immediate delayed/dependent/concurrent jobs, automatic and explicit detachment, async mailbox isolation/completion order/request-key retry cursors/bounds, heterogeneous future DAGs and restart safety, routing metadata normalization, CDP route binding and bounded wake submission, recipe stats/traces/suggestions, due dry-run continuations, a bounded desktop snapshot, and a semantic invoke against a disposable WPF window. The live Secure MCP Tunnel path, ChatGPT model behavior, and Windows supervisor crash-recovery path are additionally verified manually because they require the signed-in interactive environment.
+The tests pin MCP `2026-07-28` and exercise discovery/list/call, strict schema rejection, the closed scatter contract including typed future references and read-only runtime diagnostics, two clients, fs conflict/undo/containment, transient atomic-replace retry injection, spill/range/search, immediate delayed/dependent/concurrent jobs, automatic and explicit detachment, async mailbox isolation/completion order/request-key retry cursors/bounds, heterogeneous future DAGs and restart safety, routing metadata normalization, CDP route binding and bounded wake submission, recipe stats/traces/suggestions, due dry-run continuations, a bounded desktop snapshot, and a semantic invoke against a disposable WPF window. The live Secure MCP Tunnel path, ChatGPT model behavior, DPAPI credential round trip, periodic Task Scheduler ensure path, and signed-in Windows recovery path are additionally verified manually because they require the interactive environment.
