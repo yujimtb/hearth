@@ -88,6 +88,10 @@ export async function sendChatPrompt(target, prompt, endpoint, timeoutMs = 30000
   }), timeoutMs, `CDP ${method} timed out`);
   try {
     await opened;
+    const readiness = await rpc('Runtime.evaluate', { expression: `(() => { const composer=document.querySelector('#prompt-textarea[contenteditable="true"]'); const visible=e => Boolean(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length)); const busy=Array.from(document.querySelectorAll('button')).some(button => { if (!visible(button)) return false; const testid=(button.getAttribute('data-testid')||'').toLowerCase(); const aria=(button.getAttribute('aria-label')||'').trim().toLowerCase(); return testid === 'stop-button' || ['stop','stop generating','stop answering','cancel response','cancel generation'].includes(aria); }); return { composerAvailable:Boolean(composer), busy }; })()`, returnByValue: true });
+    const ready = readiness?.result?.value;
+    if (!ready?.composerAvailable) throw new Error('ChatGPT composer not available');
+    if (ready.busy) return { state: 'busy', reason: 'ChatGPT response is still generating' };
     const focus = await rpc('Runtime.evaluate', { expression: `(() => { const e=document.querySelector('#prompt-textarea[contenteditable="true"]'); if(!e) return false; e.focus(); const s=getSelection(),r=document.createRange(); r.selectNodeContents(e); s.removeAllRanges(); s.addRange(r); return true; })()`, returnByValue: true });
     if (focus?.result?.value !== true) throw new Error('ChatGPT composer not available');
     await rpc('Input.insertText', { text: prompt });

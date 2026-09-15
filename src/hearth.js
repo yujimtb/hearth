@@ -388,7 +388,7 @@ export class Hearth {
       if (seq) {
         const mailbox = this.db.prepare('SELECT last_activity_at FROM mailboxes WHERE route_key=?').get(current.route_key);
         const due = new Date(Math.max(Date.parse(mailbox.last_activity_at) + this.config.wake.quiet_ms, Date.now() + this.config.wake.debounce_ms)).toISOString();
-        this.db.prepare('UPDATE mailboxes SET wake_due_at=? WHERE route_key=?').run(due, current.route_key);
+        this.db.prepare('UPDATE mailboxes SET wake_due_at=?,wake_attempts=0 WHERE route_key=?').run(due, current.route_key);
       }
       this.db.exec('COMMIT');
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
@@ -402,7 +402,7 @@ export class Hearth {
       if (!row) { const state = this.db.prepare('SELECT state FROM futures WHERE id=?').get(id)?.state; this.db.exec('COMMIT'); return state; }
       const seq = Number(this.db.prepare('SELECT COALESCE(MAX(mailbox_seq),0)+1 AS seq FROM futures WHERE route_key=?').get(row.route_key).seq); const result = { state: 'cancelled', id };
       this.db.prepare("UPDATE futures SET state='cancelled',updated_at=?,completed_at=?,result=?,mailbox_seq=? WHERE id=? AND state='queued'").run(at, at, json(result), seq, id);
-      const mailbox = this.db.prepare('SELECT last_activity_at FROM mailboxes WHERE route_key=?').get(row.route_key); const due = new Date(Math.max(Date.parse(mailbox.last_activity_at) + this.config.wake.quiet_ms, Date.now() + this.config.wake.debounce_ms)).toISOString(); this.db.prepare('UPDATE mailboxes SET wake_due_at=? WHERE route_key=?').run(due, row.route_key);
+      const mailbox = this.db.prepare('SELECT last_activity_at FROM mailboxes WHERE route_key=?').get(row.route_key); const due = new Date(Math.max(Date.parse(mailbox.last_activity_at) + this.config.wake.quiet_ms, Date.now() + this.config.wake.debounce_ms)).toISOString(); this.db.prepare('UPDATE mailboxes SET wake_due_at=?,wake_attempts=0 WHERE route_key=?').run(due, row.route_key);
       this.db.exec('COMMIT'); return 'cancelled';
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
@@ -641,18 +641,38 @@ export class Hearth {
     const routes = this.db.prepare("SELECT * FROM mailboxes WHERE target_id IS NOT NULL AND wake_claimed_at IS NULL AND wake_due_at IS NOT NULL AND wake_due_at<=? AND last_activity_at<=? AND (last_wake_at IS NULL OR last_wake_at<=?) AND wake_attempts<? AND EXISTS(SELECT 1 FROM futures WHERE route_key=mailboxes.route_key AND mailbox_seq>mailboxes.ack_seq) ORDER BY wake_due_at LIMIT 8").all(timestamp, quietCutoff, cooldownCutoff, this.config.wake.max_attempts);
     if (!routes.length) return;
     let targets; try { targets = await this.cdp.listTargets(this.config.wake.cdp_url); } catch (error) {
-      const failedAt = now(); const retryAt = new Date(Date.now() + this.config.wake.cooldown_ms).toISOString();
-      for (const route of routes) this.db.prepare('UPDATE mailboxes SET wake_attempts=wake_attempts+1,last_wake_at=?,wake_due_at=CASE WHEN wake_attempts+1>=? THEN NULL ELSE ? END WHERE route_key=?').run(failedAt, this.config.wake.max_attempts, retryAt, route.route_key);
-      this.event('route.wake_validation_failed', null, { error: error.message }); return;
+      const retryAt = new Date(Date.now() + this.config.wake.cooldown_ms).toISOString();
+      for (const route of routes) this.db.prepare('UPDATE mailboxes SET wake_claimed_at=NULL,wake_due_at=? WHERE route_key=?').run(retryAt, route.route_key);
+      this.event('route.wake_validation_failed', null, { error: error.message, retry_at: retryAt }); return;
     }
-    const targetFor = candidate => targets.find(target => target.id === candidate.target_id && safeChatUrl(target.url) === candidate.target_url);
+    const targetFor = candidate => {
+      const exact = targets.find(target => target.id === candidate.target_id && safeChatUrl(target.url) === candidate.target_url);
+      if (exact) return exact;
+      const byUrl = targets.filter(target => safeChatUrl(target.url) === candidate.target_url);
+      if (byUrl.length !== 1) return null;
+      const rebound = byUrl[0];
+      this.db.prepare('UPDATE mailboxes SET target_id=?,bound_at=? WHERE route_key=?').run(rebound.id, now(), candidate.route_key);
+      this.event('route.rebound', null, { state: 'completed' });
+      candidate.target_id = rebound.id;
+      return rebound;
+    };
     const route = routes.find(candidate => targetFor(candidate));
-    for (const candidate of routes.filter(candidate => !targetFor(candidate))) this.db.prepare('UPDATE mailboxes SET target_id=NULL,target_url=NULL,bound_at=NULL,wake_due_at=NULL WHERE route_key=?').run(candidate.route_key);
+    const missing = routes.filter(candidate => !targetFor(candidate));
+    if (missing.length) {
+      const retryAt = new Date(Date.now() + this.config.wake.cooldown_ms).toISOString(); let retained = 0;
+      for (const candidate of missing) {
+        if (!safeChatUrl(candidate.target_url)) this.db.prepare('UPDATE mailboxes SET target_id=NULL,target_url=NULL,bound_at=NULL,wake_due_at=NULL,wake_claimed_at=NULL WHERE route_key=?').run(candidate.route_key);
+        else { this.db.prepare('UPDATE mailboxes SET wake_claimed_at=NULL,wake_due_at=? WHERE route_key=?').run(retryAt, candidate.route_key); retained++; }
+      }
+      this.event('route.wake_target_missing', null, { count: missing.length, retained, retry_at: retryAt });
+    }
     if (!route) return;
     const target = targetFor(route); const claimed = now(); const cursor = this.db.prepare('SELECT MAX(mailbox_seq) AS seq FROM futures WHERE route_key=?').get(route.route_key).seq; const update = this.db.prepare('UPDATE mailboxes SET wake_claimed_at=?,wake_due_at=NULL,wake_attempts=wake_attempts+1,last_wake_at=?,wake_cursor=? WHERE route_key=? AND wake_claimed_at IS NULL').run(claimed, claimed, cursor, route.route_key); if (!update.changes) return;
     this.waking = true;
-    const wakePrompt = `Use only Hearth. First call machine with operation host_info exactly once. Read any arrivals in that Hearth result, then continue the prior task from those results without polling. Wake token: hearth-wake:${randomUUID()}`;
+    const wakePrompt = `Use only Hearth. First call artifact with operation list and limit 1 exactly once. Read any arrivals in that Hearth result without polling. Then continue only the latest user-requested task. Respect any explicit pause, preparation-only, or do-not-start boundary already present in the conversation; a run checkpoint next_actions field alone is not authorization to start a deferred phase. Do not call machine just to wake. Wake token: hearth-wake:${randomUUID()}`;
+    let wakeDeferred = false;
     const wake = Promise.resolve().then(() => this.cdp.send(target, wakePrompt)).then(async result => {
+      if (result?.state === 'busy') { wakeDeferred = true; this.event('route.wake', null, { state: 'deferred', reason: result.reason || 'conversation busy' }); return; }
       if (result?.state && result.state !== 'completed') throw new Error(`CDP wake returned ${result.state}`);
       const deadline = Date.now() + this.config.wake.timeout_ms;
       while (this.db && Date.now() < deadline) {
@@ -664,8 +684,9 @@ export class Hearth {
     }).catch(error => this.event('route.wake', null, { state: 'blocked', error: error.message })).finally(() => {
       if (this.db) {
         const current = this.db.prepare('SELECT offered_seq,wake_attempts,wake_due_at FROM mailboxes WHERE route_key=?').get(route.route_key); const max = this.db.prepare('SELECT MAX(mailbox_seq) AS seq FROM futures WHERE route_key=?').get(route.route_key).seq;
-        const retry = current.offered_seq < max && current.wake_attempts < this.config.wake.max_attempts ? current.wake_due_at || new Date(Date.now() + this.config.wake.cooldown_ms).toISOString() : null;
-        this.db.prepare('UPDATE mailboxes SET wake_claimed_at=NULL,wake_due_at=? WHERE route_key=?').run(retry, route.route_key);
+        const retry = current.offered_seq < max && (wakeDeferred || current.wake_attempts < this.config.wake.max_attempts) ? current.wake_due_at || new Date(Date.now() + this.config.wake.cooldown_ms).toISOString() : null;
+        if (wakeDeferred) this.db.prepare('UPDATE mailboxes SET wake_claimed_at=NULL,wake_due_at=?,wake_attempts=CASE WHEN wake_attempts>0 THEN wake_attempts-1 ELSE 0 END WHERE route_key=?').run(retry, route.route_key);
+        else this.db.prepare('UPDATE mailboxes SET wake_claimed_at=NULL,wake_due_at=? WHERE route_key=?').run(retry, route.route_key);
       }
       this.waking = false; this.detachedActive.delete(wake);
     });
